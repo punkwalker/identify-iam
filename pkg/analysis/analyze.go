@@ -4,8 +4,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 )
 
-var BatchSize = 10
-
 var AnalysisList []Analysis
 
 type Analysis interface {

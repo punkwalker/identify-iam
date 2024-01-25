@@ -2,7 +2,7 @@ package analysis
 
 import (
 	"context"
-	"strings"
+	"net/url"
 
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/iam/types"
@@ -98,11 +98,7 @@ func (r *ROLE) ListPolicies(roleName *string, client *iam.Client, role *IAMRole,
 	}
 }
 
-func (r *ROLE) VerifyInlinePolicy(policyName *string, roleName *string, client *iam.Client, role *IAMRole) bool {
-
-	policy := IAMPolicy{
-		PolicyName: *policyName,
-	}
+func (r *ROLE) VerifyInlinePolicy(policyName *string, roleName *string, client *iam.Client, role *IAMRole) {
 
 	output, err := client.GetRolePolicy(context.TODO(), &iam.GetRolePolicyInput{PolicyName: policyName, RoleName: roleName})
 
@@ -110,66 +106,24 @@ func (r *ROLE) VerifyInlinePolicy(policyName *string, roleName *string, client *
 		panic(err)
 	}
 
-	p := parseDocument(output.PolicyDocument)
+	policyDocument, err := url.QueryUnescape(*output.PolicyDocument)
 
 	if err != nil {
 		panic(err)
 	}
 
-	if err != nil {
-		panic(err)
-	}
+	// Proceed Only if we see any of the associated API action
+	if isAction(APIListRegex, &policyDocument) {
 
-	for _, statement := range p.Statements.Values() {
-		actions := statement.Action.Values()
-		effect := statement.Effect
-
-		if isECSAction(strings.Join(actions, ",")) && effect == "Allow" {
-			policy.StatementIds = append(policy.StatementIds, statement.Sid)
+		policy := IAMPolicy{
+			PolicyName: *policyName,
 		}
-	}
 
-	if policy.StatementIds != nil {
-		role.InlinePolicies = append(role.InlinePolicies, policy)
-		return true
-	}
+		processPolicy(&policyDocument, &policy)
 
-	return false
+		if policy.StatementIds != nil {
+			role.InlinePolicies = append(role.InlinePolicies, policy)
+		}
+
+	}
 }
-
-// func (r *ROLE) VerifyAttachedPolicy(policyArn *string, client *iam.Client, entity *IdentifiedEntity) {
-
-// 	if isAWSManaged(policyArn) {
-// 		return
-// 	}
-
-// 	policy, err := client.GetPolicy(context.TODO(), &iam.GetPolicyInput{PolicyArn: policyArn})
-
-// 	AttachedPolicy := IAMPolicy{
-// 		PolicyName: *policy.Policy.PolicyName,
-// 	}
-
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	policyVersion, err := client.GetPolicyVersion(context.TODO(), &iam.GetPolicyVersionInput{PolicyArn: policyArn, VersionId: policy.Policy.DefaultVersionId})
-
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	p := parseDocument(policyVersion.PolicyVersion.Document)
-
-// 	for _, statement := range p.Statements.Values() {
-// 		actions := statement.Action.Values()
-// 		effect := statement.Effect
-// 		if isECSAction(strings.Join(actions, ",")) && effect == "Allow" {
-// 			AttachedPolicy.StatementIds = append(AttachedPolicy.StatementIds, statement.Sid)
-// 		}
-// 	}
-
-// 	if AttachedPolicy.StatementIds != nil {
-// 		entity.Policies = append(entity.Policies, AttachedPolicy)
-// 	}
-// }

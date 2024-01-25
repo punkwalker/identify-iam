@@ -1,0 +1,10 @@
+[
+    "ecs:CreateCapacityProvider",
+    "ecs:CreateCluster",
+    "ecs:CreateService",
+    "ecs:CreateTaskSet",
+    "ecs:RegisterContainerInstance",
+    "ecs:RegisterTaskDefinition",
+    "ecs:RunTask",
+    "ecs:StartTask"
+]

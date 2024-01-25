@@ -12,22 +12,23 @@ import (
 	"github.com/micahhausler/aws-iam-policy/policy"
 )
 
-// var APIListRegex = regexp.MustCompile(`ecs:(Create(CapacityProvider|Cluster|Service|TaskSet)|Register(ContainerInstance|TaskDefinition)|(Run|Start)Task)`)
+var APIListRegex = regexp.MustCompile(`(ecs:(Create(CapacityProvider|Cluster|Service|TaskSet)|Register(ContainerInstance|TaskDefinition)|(Run|Start)Task))|(ecs:(Create\*|Register\*|Run\*|Start*))`)
 
 var ManagedPoliciesSeen []string
 
-var APIListRegex = regexp.MustCompile(`ecs`)
+var NewAPIegex = regexp.MustCompile(`ecs:(TagResource|Tag*)`)
 
-func parseDocument(document *string) *policy.Policy {
+var mu sync.Mutex
+
+var wg sync.WaitGroup
+
+var BatchSize = 10
+
+func parseDocument(policyDocument *string) *policy.Policy {
 
 	var p policy.Policy
-	policyDocument, err := url.QueryUnescape(*document)
 
-	if err != nil {
-		panic(err)
-	}
-
-	err = json.Unmarshal([]byte(policyDocument), &p)
+	err := json.Unmarshal([]byte(*policyDocument), &p)
 
 	if err != nil {
 		panic(err)
@@ -41,13 +42,42 @@ func isAWSManaged(policyARN *string) bool {
 	return strings.HasPrefix(*policyARN, "arn:aws:iam::aws:policy")
 }
 
-func isECSAction(val string) bool {
-	// fmt.Printf("\n#### Checking ECSAtion in %s\n", val)
-	if match := APIListRegex.FindStringSubmatch(val); match != nil {
-		return true
-	}
-	return false
+func isAction(actionsRegex *regexp.Regexp, policyDocument *string) bool {
+	return actionsRegex.MatchString(*policyDocument)
+}
 
+func processPolicy(policyDocument *string, policy *IAMPolicy) {
+
+	p := parseDocument(policyDocument)
+
+	for _, statement := range p.Statements.Values() {
+		effect := statement.Effect
+		actions := ""
+
+		if effect == "Allow" && statement.Action != nil { // We are only interested in Action if the effect is Allow
+			actions = strings.Join(statement.Action.Values(), ",")
+		} else if effect == "Deny" && statement.NotAction != nil { // We are only interested in NotAction if the effect is Deny
+			actions = strings.Join(statement.NotAction.Values(), ",")
+		}
+
+		// Proceed Only if Actions do not have ecs:*
+		if !strings.Contains(actions, "ecs:*") {
+
+			// Proceed only if ecs:TagResource is not present
+			if !isAction(NewAPIegex, &actions) {
+
+				// Proceed only if we see any of the associated API action in statement
+				if isAction(APIListRegex, &actions) {
+					policy.StatementIds = append(policy.StatementIds, statement.Sid)
+				}
+
+			} else {
+
+				break // Break as we found at least one ECSTagAction
+			}
+		}
+
+	}
 }
 
 func hasSeenPolicy(policyARN *string) bool {
@@ -58,15 +88,13 @@ func VerifyAttachedPolicy(policyArn *string, client *iam.Client, managedPolicies
 
 	if !hasSeenPolicy(policyArn) {
 
+		ManagedPoliciesSeen = append(ManagedPoliciesSeen, *policyArn)
+
 		if isAWSManaged(policyArn) {
 			return
 		}
 
 		policy, err := client.GetPolicy(context.TODO(), &iam.GetPolicyInput{PolicyArn: policyArn})
-
-		attachedPolicy := IAMPolicy{
-			PolicyName: *policy.Policy.PolicyName,
-		}
 
 		if err != nil {
 			panic(err)
@@ -77,35 +105,24 @@ func VerifyAttachedPolicy(policyArn *string, client *iam.Client, managedPolicies
 		if err != nil {
 			panic(err)
 		}
-
-		p := parseDocument(policyVersion.PolicyVersion.Document)
-
-		for _, statement := range p.Statements.Values() {
-			actions := statement.Action.Values()
-			effect := statement.Effect
-			if isECSAction(strings.Join(actions, ",")) && effect == "Allow" {
-				attachedPolicy.StatementIds = append(attachedPolicy.StatementIds, statement.Sid)
-			}
+		policyDocument, err := url.QueryUnescape(*policyVersion.PolicyVersion.Document)
+		if err != nil {
+			panic(err)
 		}
 
-		if attachedPolicy.StatementIds != nil {
-			*managedPolicies = append(*managedPolicies, attachedPolicy)
-			ManagedPoliciesSeen = append(ManagedPoliciesSeen, *policyArn)
+		// Proceed Only if we see any of the associated API action
+		if isAction(APIListRegex, &policyDocument) {
+
+			attachedPolicy := IAMPolicy{
+				PolicyName: *policy.Policy.PolicyName,
+			}
+
+			processPolicy(&policyDocument, &attachedPolicy)
+
+			if attachedPolicy.StatementIds != nil {
+				*managedPolicies = append(*managedPolicies, attachedPolicy)
+			}
+
 		}
 	}
-}
-
-var mu sync.Mutex
-var wg sync.WaitGroup
-
-// Parallel runs a set of workers across a set of tools
-func Parallel(role *string, client *iam.Client, identified *IdentifiedEntities, fn func(role *string, client *iam.Client, identified *IdentifiedEntities)) error {
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		fn(role, client, identified)
-	}()
-	wg.Wait()
-	return nil
 }
