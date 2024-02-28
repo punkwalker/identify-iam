@@ -15,11 +15,15 @@ func init() {
 type GROUP struct {
 }
 
-func (g *GROUP) Identify(client *iam.Client, identified *IdentifiedEntities) {
+func (g *GROUP) Identify(cfg *Configuration, opts *Options) {
 
-	groupPaginator := iam.NewListGroupsPaginator(client, &iam.ListGroupsInput{}, func(po *iam.ListGroupsPaginatorOptions) {
-		po.Limit = 100
+	wg := Configuration.NewWaitGroup(Configuration{})
+
+	groupPaginator := iam.NewListGroupsPaginator(cfg.IAMClient, &iam.ListGroupsInput{}, func(po *iam.ListGroupsPaginatorOptions) {
+		po.Limit = cfg.PageSize
 	})
+
+	go QueueWorker(cfg, opts)
 
 	for groupPaginator.HasMorePages() {
 
@@ -28,9 +32,16 @@ func (g *GROUP) Identify(client *iam.Client, identified *IdentifiedEntities) {
 		if err != nil {
 			panic(err)
 		}
-		for start := 0; start < len(output.Groups); start += BatchSize {
 
-			end := start + BatchSize
+		batchSize := len(output.Groups)
+
+		if len(output.Groups) > opts.Concurrancy {
+			batchSize = (len(output.Groups) / opts.Concurrancy)
+		}
+
+		for start := 0; start < len(output.Groups); start += batchSize {
+
+			end := start + batchSize
 
 			if end > len(output.Groups) {
 				end = len(output.Groups)
@@ -41,67 +52,73 @@ func (g *GROUP) Identify(client *iam.Client, identified *IdentifiedEntities) {
 			wg.Add(1)
 			go func(groupNames *[]types.Group) {
 				defer wg.Done()
-				g.ProcessBatch(groupNames, client, identified)
+				g.ListPolicies(groupNames, cfg)
 			}(&groupNames)
-
 		}
 		wg.Wait()
 	}
 }
 
-func (g *GROUP) ProcessBatch(groups *[]types.Group, client *iam.Client, identified *IdentifiedEntities) {
-	managedPolicies := []IAMPolicy{}
-
+func (g *GROUP) ListPolicies(groups *[]types.Group, cfg *Configuration) {
 	for _, group := range *groups {
-		grp := IAMGroup{
-			Name: *group.GroupName,
-		}
-		g.ListPolicies(group.GroupName, client, &grp, &managedPolicies)
-		if grp.InlinePolicies != nil {
-			mu.Lock()
-			identified.Groups = append(identified.Groups, grp)
-			mu.Unlock()
+		mu := Configuration.NewMutex(Configuration{})
+		entity := Entity{
+			Name:     *group.GroupName,
+			Type:     "Group",
+			Policies: []string{},
 		}
 
-	}
+		idEntity := IdentifiedEntity{
+			Name:             entity.Name,
+			DeniedByPolicies: []string{},
+		}
+		inlinePolicies, err := cfg.IAMClient.ListGroupPolicies(context.TODO(), &iam.ListGroupPoliciesInput{GroupName: &entity.Name})
 
-	if managedPolicies != nil {
-		mu.Lock()
-		identified.ManagedPolicies = append(identified.ManagedPolicies, managedPolicies...)
-		mu.Unlock()
+		if err != nil {
+			panic(err)
+		}
+
+		if inlinePolicies != nil {
+			for _, policyName := range inlinePolicies.PolicyNames {
+				g.VerifyInlinePolicy(&policyName, &entity, cfg.IAMClient)
+			}
+		}
+
+		attachedPolicies, err := cfg.IAMClient.ListAttachedGroupPolicies(context.TODO(), &iam.ListAttachedGroupPoliciesInput{GroupName: &entity.Name})
+
+		if err != nil {
+			panic(err)
+		}
+
+		if attachedPolicies != nil {
+			for _, policy := range attachedPolicies.AttachedPolicies {
+				mu.Lock()
+				inCache := cfg.PolicyDecisionCache[*policy.PolicyArn]
+				mu.Unlock()
+
+				if inCache != "" {
+
+					if inCache == "Denied" {
+
+						idEntity.Decision = types.PolicyEvaluationDecisionTypeExplicitDeny
+						idEntity.DeniedByPolicies = append(idEntity.DeniedByPolicies, *policy.PolicyArn)
+						addEntity(&entity, idEntity, cfg)
+					}
+
+				} else {
+					VerifyAttachedPolicy(policy.PolicyArn, &entity, cfg.IAMClient)
+				}
+			}
+		}
+		if len(entity.Policies) != 0 {
+			cfg.Queue <- entity // Queue Entity for processing
+		}
 	}
 }
 
-func (g *GROUP) ListPolicies(groupName *string, client *iam.Client, group *IAMGroup, managedPolicies *[]IAMPolicy) {
+func (g *GROUP) VerifyInlinePolicy(policyName *string, entity *Entity, client *iam.Client) {
 
-	inlinePolicies, err := client.ListGroupPolicies(context.TODO(), &iam.ListGroupPoliciesInput{GroupName: groupName})
-
-	if err != nil {
-		panic(err)
-	}
-
-	attachedPolicies, err := client.ListAttachedGroupPolicies(context.TODO(), &iam.ListAttachedGroupPoliciesInput{GroupName: groupName})
-
-	if err != nil {
-		panic(err)
-	}
-
-	if inlinePolicies != nil {
-		for _, policyName := range inlinePolicies.PolicyNames {
-			g.VerifyInlinePolicy(&policyName, groupName, client, group)
-		}
-	}
-
-	if attachedPolicies != nil {
-		for _, policy := range attachedPolicies.AttachedPolicies {
-			VerifyAttachedPolicy(policy.PolicyArn, client, managedPolicies)
-		}
-	}
-}
-
-func (g *GROUP) VerifyInlinePolicy(policyName *string, groupName *string, client *iam.Client, group *IAMGroup) {
-
-	output, err := client.GetGroupPolicy(context.TODO(), &iam.GetGroupPolicyInput{PolicyName: policyName, GroupName: groupName})
+	output, err := client.GetGroupPolicy(context.TODO(), &iam.GetGroupPolicyInput{PolicyName: policyName, GroupName: &entity.Name})
 
 	if err != nil {
 		panic(err)
@@ -113,18 +130,5 @@ func (g *GROUP) VerifyInlinePolicy(policyName *string, groupName *string, client
 		panic(err)
 	}
 
-	// Proceed Only if we see any of the associated API action
-	if isAction(APIListRegex, &policyDocument) {
-
-		policy := IAMPolicy{
-			PolicyName: *policyName,
-		}
-
-		processPolicy(&policyDocument, &policy)
-
-		if policy.StatementIds != nil {
-			group.InlinePolicies = append(group.InlinePolicies, policy)
-		}
-
-	}
+	processPolicy(&policyDocument, &entity.Policies, policyName)
 }

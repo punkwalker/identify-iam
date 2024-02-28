@@ -5,24 +5,16 @@ import (
 	"encoding/json"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/micahhausler/aws-iam-policy/policy"
 )
 
-var APIListRegex = regexp.MustCompile(`(ecs:(Create(CapacityProvider|Cluster|Service|TaskSet)|Register(ContainerInstance|TaskDefinition)|(Run|Start)Task))|(ecs:(Create\*|Register\*|Run\*|Start*))`)
-
-var ManagedPoliciesSeen []string
-
-var NewAPIegex = regexp.MustCompile(`ecs:(TagResource|Tag*)`)
-
-var mu sync.Mutex
-
-var wg sync.WaitGroup
-
-var BatchSize = 10
+type Utils struct {
+}
 
 func parseDocument(policyDocument *string) *policy.Policy {
 
@@ -38,89 +30,181 @@ func parseDocument(policyDocument *string) *policy.Policy {
 
 }
 
-func isAWSManaged(policyARN *string) bool {
-	return strings.HasPrefix(*policyARN, "arn:aws:iam::aws:policy")
-}
-
 func isAction(actionsRegex *regexp.Regexp, policyDocument *string) bool {
 	return actionsRegex.MatchString(*policyDocument)
 }
 
-func processPolicy(policyDocument *string, policy *IAMPolicy) {
+func processPolicy(policyDocument *string, policies *[]string, policyName *string) {
 
 	p := parseDocument(policyDocument)
+	statements := []policy.Statement{}
 
 	for _, statement := range p.Statements.Values() {
-		effect := statement.Effect
-		actions := ""
 
-		if effect == "Allow" && statement.Action != nil { // We are only interested in Action if the effect is Allow
-			actions = strings.Join(statement.Action.Values(), ",")
-		} else if effect == "Deny" && statement.NotAction != nil { // We are only interested in NotAction if the effect is Deny
-			actions = strings.Join(statement.NotAction.Values(), ",")
-		}
+		newStatement := policy.Statement{}
 
-		// Proceed Only if Actions do not have ecs:*
-		if !strings.Contains(actions, "ecs:*") {
+		if statement.Action != nil {
+			actions := statement.Action.Values()
 
-			// Proceed only if ecs:TagResource is not present
-			if !isAction(NewAPIegex, &actions) {
+			newStatement = policy.Statement{
+				Action:   policy.NewStringOrSlice(false, actions...),
+				Resource: policy.NewStringOrSlice(true, "*"),
+				Sid:      statement.Sid,
+				Effect:   statement.Effect,
+			}
+		} else if statement.NotAction != nil {
+			actions := statement.NotAction.Values()
 
-				// Proceed only if we see any of the associated API action in statement
-				if isAction(APIListRegex, &actions) {
-					policy.StatementIds = append(policy.StatementIds, statement.Sid)
-				}
-
-			} else {
-
-				break // Break as we found at least one ECSTagAction
+			newStatement = policy.Statement{
+				Action:   policy.NewStringOrSlice(false, actions...),
+				Resource: policy.NewStringOrSlice(true, "*"),
+				Sid:      statement.Sid,
+				Effect:   statement.Effect,
 			}
 		}
 
+		statements = append(statements, newStatement)
+	}
+
+	if len(statements) != 0 {
+
+		customPolicy := policy.Policy{
+			Id:         *policyName,
+			Statements: policy.NewStatementOrSlice(statements...),
+			Version:    p.Version,
+		}
+
+		policyBytes, err := json.Marshal(customPolicy)
+
+		if err != nil {
+			panic(err)
+		}
+
+		policyString := string(policyBytes)
+
+		*policies = append(*policies, policyString)
+	}
+
+}
+
+func VerifyAttachedPolicy(policyArn *string, entity *Entity, client *iam.Client) {
+
+	policyOut, err := client.GetPolicy(context.TODO(), &iam.GetPolicyInput{PolicyArn: policyArn})
+
+	if err != nil {
+		panic(err)
+	}
+
+	policyVersion, err := client.GetPolicyVersion(context.TODO(), &iam.GetPolicyVersionInput{PolicyArn: policyArn, VersionId: policyOut.Policy.DefaultVersionId})
+
+	if err != nil {
+		panic(err)
+	}
+	policyDocument, err := url.QueryUnescape(*policyVersion.PolicyVersion.Document)
+	if err != nil {
+		panic(err)
+	}
+
+	processPolicy(&policyDocument, &entity.Policies, policyArn)
+
+}
+
+func addEntity(entity *Entity, idEntity IdentifiedEntity, cfg *Configuration) {
+
+	mu := Configuration.NewMutex(Configuration{})
+	switch {
+	case entity.Type == "Role":
+		mu.Lock()
+		cfg.Identified.Roles = append(cfg.Identified.Roles, idEntity)
+		mu.Unlock()
+	case entity.Type == "User":
+		mu.Lock()
+		cfg.Identified.Users = append(cfg.Identified.Users, idEntity)
+		mu.Unlock()
+	case entity.Type == "Group":
+		mu.Lock()
+		cfg.Identified.Groups = append(cfg.Identified.Groups, idEntity)
+		mu.Unlock()
+	default:
+		panic("Invalid Enitity Type")
 	}
 }
 
-func hasSeenPolicy(policyARN *string) bool {
-	return strings.Contains(strings.Join(ManagedPoliciesSeen, ","), *policyARN)
-}
-
-func VerifyAttachedPolicy(policyArn *string, client *iam.Client, managedPolicies *[]IAMPolicy) {
-
-	if !hasSeenPolicy(policyArn) {
-
-		ManagedPoliciesSeen = append(ManagedPoliciesSeen, *policyArn)
-
-		if isAWSManaged(policyArn) {
-			return
+func QueueWorker(cfg *Configuration, opts *Options) {
+	mu := Configuration.NewMutex(Configuration{})
+	for entity := range cfg.Queue {
+		idEntity := IdentifiedEntity{
+			Name:             entity.Name,
+			DeniedByPolicies: []string{},
 		}
 
-		policy, err := client.GetPolicy(context.TODO(), &iam.GetPolicyInput{PolicyArn: policyArn})
+		policies := strings.Join(entity.Policies, ",")
+		if isAction(opts.APIregex, &policies) {
 
-		if err != nil {
-			panic(err)
-		}
+			out2, err := cfg.IAMClient.SimulateCustomPolicy(context.TODO(), &iam.SimulateCustomPolicyInput{
+				ActionNames:     opts.NewAction,
+				PolicyInputList: entity.Policies,
+			})
 
-		policyVersion, err := client.GetPolicyVersion(context.TODO(), &iam.GetPolicyVersionInput{PolicyArn: policyArn, VersionId: policy.Policy.DefaultVersionId})
-
-		if err != nil {
-			panic(err)
-		}
-		policyDocument, err := url.QueryUnescape(*policyVersion.PolicyVersion.Document)
-		if err != nil {
-			panic(err)
-		}
-
-		// Proceed Only if we see any of the associated API action
-		if isAction(APIListRegex, &policyDocument) {
-
-			attachedPolicy := IAMPolicy{
-				PolicyName: *policy.Policy.PolicyName,
+			if err != nil {
+				panic(err)
 			}
 
-			processPolicy(&policyDocument, &attachedPolicy)
+			for _, result := range out2.EvaluationResults {
 
-			if attachedPolicy.StatementIds != nil {
-				*managedPolicies = append(*managedPolicies, attachedPolicy)
+				if result.EvalDecision != types.PolicyEvaluationDecisionTypeAllowed {
+					idEntity.Decision = result.EvalDecision
+
+					for _, match := range result.MatchedStatements {
+
+						policyIndex, err := strconv.Atoi(strings.Split(*match.SourcePolicyId, ".")[1])
+
+						if err != nil {
+							panic(err)
+						}
+
+						p := policy.Policy{}
+						err = json.Unmarshal([]byte(entity.Policies[policyIndex-1]), &p)
+
+						if err != nil {
+							panic(err)
+						}
+
+						idEntity.DeniedByPolicies = append(idEntity.DeniedByPolicies, p.Id)
+
+						cfg.PolicyDecisionCache[p.Id] = string(idEntity.Decision)
+
+					}
+
+					addEntity(&entity, idEntity, cfg)
+
+				} else {
+
+					idEntity.Decision = result.EvalDecision
+
+					for _, match := range result.MatchedStatements {
+
+						policyIndex, err := strconv.Atoi(strings.Split(*match.SourcePolicyId, ".")[1])
+
+						if err != nil {
+							panic(err)
+						}
+
+						p := policy.Policy{}
+						err = json.Unmarshal([]byte(entity.Policies[policyIndex-1]), &p)
+
+						if err != nil {
+							panic(err)
+						}
+
+						mu.Lock()
+						cfg.PolicyDecisionCache[p.Id] = string(idEntity.Decision)
+						mu.Unlock()
+
+					}
+
+				}
+
 			}
 
 		}

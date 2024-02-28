@@ -1,46 +1,44 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/punkwalker/identify-iam/pkg/analysis"
 	"gopkg.in/yaml.v2"
 )
 
 func main() {
-	format := flag.String("o", "yaml", "Output format")
-	flag.Parse()
 
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+	opts := analysis.Options.NewOpts(analysis.Options{})
+
+	cfg, err := analysis.Configuration.NewConfig(analysis.Configuration{})
+
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
-	client := iam.NewFromConfig(cfg)
-
-	analysis.BatchSize = 10
-
-	var identified analysis.IdentifiedEntities
+	wg := analysis.Configuration.NewWaitGroup(analysis.Configuration{})
 
 	for _, a := range analysis.AnalysisList {
-		a.Identify(client, &identified)
+		wg.Add(1)
+		go func(cfg *analysis.Configuration, opts *analysis.Options) {
+			defer wg.Done()
+			a.Identify(cfg, opts)
+		}(cfg, opts)
+		wg.Wait()
 	}
 
-	if *format != "json" {
-		identifiedYAML, err := yaml.Marshal(identified)
+	if opts.Output != "json" {
+		identifiedYAML, err := yaml.Marshal(cfg.Identified)
 		if err != nil {
 			log.Fatal(err)
 		}
 		fmt.Printf("%v", string(identifiedYAML))
 
 	} else {
-		identifiedJSON, err := json.Marshal(identified)
+		identifiedJSON, err := json.Marshal(cfg.Identified)
 		if err != nil {
 			log.Fatal(err)
 		}

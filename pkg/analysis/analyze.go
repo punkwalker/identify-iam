@@ -1,51 +1,31 @@
 package analysis
 
 import (
-	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/iam/types"
 )
 
 var AnalysisList []Analysis
 
 type Analysis interface {
-	Identify(client *iam.Client, identified *IdentifiedEntities)
+	Identify(cfg *Configuration, opts *Options)
 }
 
 type IdentifiedEntities struct {
-	Users           []IAMUser
-	Roles           []IAMRole
-	Groups          []IAMGroup
-	ManagedPolicies []IAMPolicy
+	Users  []IdentifiedEntity
+	Roles  []IdentifiedEntity
+	Groups []IdentifiedEntity
 }
 
 type IdentifiedEntity struct {
+	Name             string
+	Decision         types.PolicyEvaluationDecisionType
+	DeniedByPolicies []string
+}
+
+type Entity struct {
 	Name     string
 	Type     string
-	Policies []IAMPolicy
-}
-
-type IAMUser struct {
-	Name           string
-	InlinePolicies []IAMPolicy
-}
-
-type IAMRole struct {
-	Name           string
-	InlinePolicies []IAMPolicy
-}
-
-type IAMGroup struct {
-	Name           string
-	InlinePolicies []IAMPolicy
-}
-
-type IAMPolicy struct {
-	PolicyName   string
-	StatementIds []string
-}
-
-type Configuration struct {
-	IAMClient  *iam.Client
-	Identified *IdentifiedEntities
+	Policies []string
 }
 
 func RegisterAnalysis(a Analysis) {
