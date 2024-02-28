@@ -44,7 +44,7 @@ Usage: ecs-tag-action-identify [OPTIONS]
 ### Running Locally
 If installing locally, make sure golang v1.20 is installed and AWS CLI is configured with [IAMReadOnlyAccess](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/IAMReadOnlyAccess.html) or equivalent permissions. 
 ```
-go install github.com/punkwalker/identify-iam/cmd/ecs-tag-action-identify@vx.x.x
+go install github.com/punkwalker/identify-iam/cmd/ecs-tag-action-identify@latest
 ```
 ### Inside docker container
 To use the tool inside docker container, execute following commands.
@@ -53,14 +53,14 @@ To use the tool inside docker container, execute following commands.
 docker run -it --net=host \
   -v ~/.aws/:/root/.aws/ \
   golang:1.20.13-alpine \
-  sh -c "go install github.com/punkwalker/identify-iam/cmd/ecs-tag-action-identify@vx.x.x && ecs-tag-action-identify"
+  sh -c "go install github.com/punkwalker/identify-iam/cmd/ecs-tag-action-identify@latest && ecs-tag-action-identify"
 
 # Using AWS Environment Variables for User
 docker run -it --net=host \
   -e AWS_ACCESS_KEY_ID=<Access-Key> \
   -e AWS_SECRET_ACCESS_KEY=<Secret-Key>
   golang:1.20.13-alpine \
-  sh -c "go install github.com/punkwalker/identify-iam/cmd/ecs-tag-action-identify@v0.1.1 && ecs-tag-action-identify"
+  sh -c "go install github.com/punkwalker/identify-iam/cmd/ecs-tag-action-identify@latest && ecs-tag-action-identify"
 
 # Using Environment Variables for Assumed Role Credentials
 docker run -it --net=host \
@@ -68,7 +68,7 @@ docker run -it --net=host \
   -e AWS_SECRET_ACCESS_KEY=<Secret-Key> \
   -e AWS_SESSION_TOKEN=<Session-Token> \
   golang:1.20.13-alpine \
-  sh -c "go install github.com/punkwalker/identify-iam/cmd/ecs-tag-action-identify@v0.1.1 && ecs-tag-action-identify"
+  sh -c "go install github.com/punkwalker/identify-iam/cmd/ecs-tag-action-identify@latest && ecs-tag-action-identify"
 ```
 ## Use Case
 Following ECS API Calls now require to have `ecs:tagResource` IAM permission for successfull functioning.
